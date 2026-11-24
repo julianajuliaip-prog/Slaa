@@ -1,0 +1,886 @@
+-- language: Lua, file: maca_hubz.lua, target: Roblox — Steal An Egg
+-- Uso: loadstring(game:HttpGet("COLE_A_URL_AQUI"))()
+-- ou cole direto no executor. RightShift esconde/mostra o painel.
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+local VU         = game:GetService("VirtualUser")
+
+local player = Players.LocalPlayer
+
+-- ================= CONFIG =================
+local CONFIG = {
+	egg_name_patterns  = { "egg", "ovo" },
+	base_name_patterns = { "base", "pen", "hatch", "deposit", "dropoff" },
+	steal_action_keys  = { "steal", "roubar", "take", "grab" },
+	drop_action_keys   = { "drop", "soltar", "place", "deposit", "throw" },
+
+	carry_speed     = 65,
+	default_speed   = 16,
+	auto_return_interval = 0.5,
+	auto_grab_interval   = 0.12,
+	auto_farm_interval   = 0.9,
+	quick_step_interval  = 0.7,
+	shuffle_interval     = 1.2,
+	radar_range          = 700,
+}
+
+-- ================= HELPERS =================
+local ui = {}
+
+local function has_any(s, list)
+	s = string.lower(tostring(s or ""))
+	for _, p in ipairs(list) do
+		if string.find(s, p, 1, true) then return true end
+	end
+	return false
+end
+
+local function get_hum()
+	local c = player.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function get_root()
+	local c = player.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function scan_parts(patterns, only_prompt)
+	local out, seen = {}, {}
+	local function walk(node, depth)
+		if depth > 6 then return end
+		for _, obj in ipairs(node:GetChildren()) do
+			if not seen[obj] then
+				seen[obj] = true
+				if obj:IsA("BasePart") then
+					local match = has_any(obj.Name, patterns)
+					if only_prompt then
+						local prompt = obj:FindFirstChildOfClass("ProximityPrompt")
+						if prompt and has_any(prompt.ActionText, CONFIG.steal_action_keys) then
+							match = true
+						end
+					end
+					if match then table.insert(out, obj) end
+				else
+					walk(obj, depth + 1)
+				end
+			end
+		end
+	end
+	walk(workspace, 0)
+	return out
+end
+
+local function find_eggs() return scan_parts(CONFIG.egg_name_patterns, true) end
+
+local function find_base()
+	local team  = player.Team
+	local bases = scan_parts(CONFIG.base_name_patterns, false)
+	if team then
+		for _, b in ipairs(bases) do
+			if b.BrickColor == team.TeamColor then return b end
+		end
+	end
+	return bases[1]
+end
+
+local function carrying_egg()
+	local ch = player.Character
+	if ch then
+		for _, d in ipairs(ch:GetDescendants()) do
+			if (d:IsA("BasePart") or d:IsA("Tool"))
+				and has_any(d.Name, CONFIG.egg_name_patterns) then
+				return true
+			end
+		end
+	end
+	local hum = get_hum()
+	if hum and hum.WalkSpeed < CONFIG.default_speed - 2 then return true end
+	return false
+end
+
+local function set_status(text)
+	if ui.status then ui.status.Text = text end
+end
+
+-- ================= ESTADO =================
+local state = {
+	speed_carry = false,
+	auto_return = false,
+	auto_grab   = false,
+	auto_farm   = false,
+	anti_stun   = false,
+	radar       = false,
+	quick_step  = false,
+	shuffle     = false,
+}
+
+local stats = { grabs = 0, returns = 0 }
+local last_grab = 0
+
+-- ================= AÇÕES =================
+local function grab_nearest_egg()
+	local hrp = get_root()
+	if not hrp then return end
+	local eggs = find_eggs()
+	local best, best_d
+	for _, e in ipairs(eggs) do
+		if e:IsDescendantOf(workspace) then
+			local d = (hrp.Position - e.Position).Magnitude
+			if not best_d or d < best_d then best, best_d = e, d end
+		end
+	end
+	if not best then return end
+	local prompt = best:FindFirstChildOfClass("ProximityPrompt")
+	if prompt and fireproximityprompt then
+		pcall(fireproximityprompt, prompt)
+		stats.grabs = stats.grabs + 1
+		last_grab = os.clock()
+	end
+end
+
+local function tp_nearest_egg()
+	local hrp = get_root()
+	if not hrp then return end
+	local eggs = find_eggs()
+	local best, best_d
+	for _, e in ipairs(eggs) do
+		if e:IsDescendantOf(workspace) then
+			local d = (hrp.Position - e.Position).Magnitude
+			if not best_d or d < best_d then best, best_d = e, d end
+		end
+	end
+	if best then hrp.CFrame = best.CFrame + Vector3.new(0, 4, 0) end
+end
+
+local function tp_to_base()
+	local hrp  = get_root()
+	local base = find_base()
+	if hrp and base then
+		hrp.CFrame = base.CFrame + Vector3.new(0, 4, 0)
+	end
+end
+
+local function deposit_at_base()
+	local hrp  = get_root()
+	local base = find_base()
+	if not hrp or not base then return false end
+	if (hrp.Position - base.Position).Magnitude > 22 then return false end
+	local fired = false
+	for _, d in ipairs(base:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			pcall(fireproximityprompt, d)
+			fired = true
+		end
+	end
+	return fired
+end
+
+local function drop_current_egg()
+	local ch  = player.Character
+	if not ch then return false end
+	local hum = ch:FindFirstChildOfClass("Humanoid")
+	local hrp = ch:FindFirstChild("HumanoidRootPart")
+
+	if player.PlayerGui then
+		for _, pg in ipairs(player.PlayerGui:GetDescendants()) do
+			if pg:IsA("TextButton") or pg:IsA("ImageButton") then
+				local label = (pg:IsA("TextButton") and pg.Text) or pg.Name or ""
+				if has_any(label, CONFIG.drop_action_keys) then
+					pcall(function()
+						if getconnections then
+							for _, conn in ipairs(getconnections(pg.MouseButton1Click)) do
+								conn:Fire()
+							end
+						end
+					end)
+					return true
+				end
+			end
+		end
+	end
+
+	if hrp then
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("ProximityPrompt")
+				and has_any(d.ActionText, CONFIG.drop_action_keys) then
+				local p = d.Parent
+				if p and p:IsA("BasePart")
+					and (hrp.Position - p.Position).Magnitude < 20 then
+					pcall(fireproximityprompt, d)
+					return true
+				end
+			end
+		end
+	end
+
+	if hrp then
+		local base = find_base()
+		local dir  = base and (hrp.Position - base.Position).Unit
+			or Vector3.new(1, 0, 1)
+		hrp.CFrame = hrp.CFrame + dir * 220 + Vector3.new(0, 40, 0)
+		task.wait(0.3)
+	end
+	if hum then hum:UnequipTools() end
+	return false
+end
+
+local function steal_part(part)
+	if not part or not part:IsDescendantOf(workspace) then return false end
+	local hrp = get_root()
+	if not hrp then return false end
+	hrp.CFrame = part.CFrame + Vector3.new(0, 4, 0)
+	task.wait(0.1)
+	local prompt = part:FindFirstChildOfClass("ProximityPrompt")
+	if prompt and fireproximityprompt then
+		pcall(fireproximityprompt, prompt)
+		stats.grabs = stats.grabs + 1
+		set_status("roubado: " .. part.Name)
+		return true
+	end
+	return false
+end
+
+local function nearest_egg(skip_base)
+	local hrp = get_root()
+	if not hrp then return nil end
+	local base = skip_base and find_base() or nil
+	local eggs = find_eggs()
+	local best, best_d
+	for _, e in ipairs(eggs) do
+		if e:IsDescendantOf(workspace) then
+			if not base or (e.Position - base.Position).Magnitude >= 40 then
+				local d = (hrp.Position - e.Position).Magnitude
+				if not best_d or d < best_d then best, best_d = e, d end
+			end
+		end
+	end
+	return best
+end
+
+local function auto_farm_tick()
+	if carrying_egg() then
+		tp_to_base()
+		task.wait(0.25)
+		deposit_at_base()
+		stats.returns = stats.returns + 1
+	else
+		local hrp = get_root()
+		if not hrp then return end
+		local best = nearest_egg(false)
+		if best then
+			hrp.CFrame = best.CFrame + Vector3.new(0, 4, 0)
+			task.wait(0.15)
+			local prompt = best:FindFirstChildOfClass("ProximityPrompt")
+			if prompt and fireproximityprompt then
+				pcall(fireproximityprompt, prompt)
+				stats.grabs = stats.grabs + 1
+			end
+		end
+	end
+end
+
+-- ================= LOOPS =================
+RunService.Heartbeat:Connect(function()
+	local hum = get_hum()
+	if not hum then return end
+
+	if state.speed_carry then
+		if carrying_egg() then
+			if hum.WalkSpeed < CONFIG.carry_speed then
+				hum.WalkSpeed = CONFIG.carry_speed
+			end
+		elseif hum.WalkSpeed ~= CONFIG.default_speed then
+			hum.WalkSpeed = CONFIG.default_speed
+		end
+	end
+
+	if state.anti_stun then
+		local s = hum:GetState()
+		if s == Enum.HumanoidStateType.FallingDown
+			or s == Enum.HumanoidStateType.PlatformStanding
+			or s == Enum.HumanoidStateType.Ragdoll then
+			hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end
+	end
+end)
+
+task.spawn(function()
+	while task.wait(CONFIG.auto_grab_interval) do
+		if state.auto_grab and os.clock() - last_grab > 0.2 then
+			pcall(grab_nearest_egg)
+		end
+	end
+end)
+
+task.spawn(function()
+	while task.wait(CONFIG.auto_return_interval) do
+		if state.auto_return and carrying_egg() then
+			pcall(function()
+				tp_to_base()
+				task.wait(0.25)
+				deposit_at_base()
+				stats.returns = stats.returns + 1
+			end)
+		end
+	end
+end)
+
+task.spawn(function()
+	while task.wait(CONFIG.auto_farm_interval) do
+		if state.auto_farm then pcall(auto_farm_tick) end
+	end
+end)
+
+task.spawn(function()
+	while task.wait(CONFIG.quick_step_interval) do
+		if state.quick_step then
+			local egg = nearest_egg(true)
+			if egg then pcall(steal_part, egg) end
+		end
+	end
+end)
+
+task.spawn(function()
+	while task.wait(CONFIG.shuffle_interval) do
+		if state.shuffle and carrying_egg() then
+			local hrp = get_root()
+			if hrp then
+				local base = find_base()
+				local away = base and (hrp.Position - base.Position)
+					or Vector3.new(1, 0, 1)
+				away = Vector3.new(away.X, 0, away.Z)
+				if away.Magnitude < 1 then away = Vector3.new(1, 0, 1) end
+				local jump = away.Unit * math.random(120, 260)
+					+ Vector3.new(math.random(-60, 60), 0, math.random(-60, 60))
+				hrp.CFrame = hrp.CFrame + jump + Vector3.new(0, 30, 0)
+				task.wait(0.3)
+				pcall(drop_current_egg)
+				task.wait(0.4)
+				local e = nearest_egg(true)
+				if e and (hrp.Position - e.Position).Magnitude < 60 then
+					local p = e:FindFirstChildOfClass("ProximityPrompt")
+					if p and fireproximityprompt then
+						pcall(fireproximityprompt, p)
+						stats.grabs = stats.grabs + 1
+					end
+				end
+			end
+		end
+	end
+end)
+
+task.spawn(function()
+	while task.wait(0.3) do
+		if state.radar then
+			local hrp = get_root()
+			if hrp then
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p ~= player and p.Character then
+						local t = p.Character:FindFirstChild("HumanoidRootPart")
+						if t then
+							local d  = (hrp.Position - t.Position).Magnitude
+							local bb = t:FindFirstChild("MacaRadar")
+							if d <= CONFIG.radar_range then
+								if not bb then
+									bb = Instance.new("BillboardGui")
+									bb.Name = "MacaRadar"
+									bb.Size = UDim2.fromOffset(90, 26)
+									bb.AlwaysOnTop = true
+									bb.StudsOffset = Vector3.new(0, 3, 0)
+									local l = Instance.new("TextLabel")
+									l.Name = "Lbl"
+									l.Size = UDim2.fromScale(1, 1)
+									l.BackgroundTransparency = 1
+									l.TextScaled = true
+									l.Font = Enum.Font.GothamBold
+									l.TextColor3 = Color3.fromRGB(255, 80, 80)
+									l.Parent = bb
+									bb.Parent = t
+								end
+								local l = bb:FindFirstChild("Lbl")
+								if l then
+									l.Text = p.Name .. " [" .. math.floor(d) .. "]"
+								end
+							elseif bb then
+								bb:Destroy()
+							end
+						end
+					end
+				end
+			end
+		else
+			for _, p in ipairs(Players:GetPlayers()) do
+				if p.Character then
+					local t = p.Character:FindFirstChild("HumanoidRootPart")
+					if t then
+						local bb = t:FindFirstChild("MacaRadar")
+						if bb then bb:Destroy() end
+					end
+				end
+			end
+		end
+	end
+end)
+
+task.spawn(function()
+	while task.wait(55) do
+		pcall(function()
+			VU:CaptureController()
+			VU:ClickButton2(Vector2.new())
+		end)
+	end
+end)
+
+-- ================= UI =================
+local gui = Instance.new("ScreenGui")
+gui.Name = "MacaHubz"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 999
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local function drag_frame(frame, handle, on_click)
+	local dragging, moved = false, false
+	local drag_start, start_pos
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			drag_start = input.Position
+			start_pos  = frame.Position
+		end
+	end)
+	UIS.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement
+			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		local delta = input.Position - drag_start
+		if delta.Magnitude > 4 then moved = true end
+		frame.Position = UDim2.new(
+			start_pos.X.Scale, start_pos.X.Offset + delta.X,
+			start_pos.Y.Scale, start_pos.Y.Offset + delta.Y)
+	end)
+	handle.InputEnded:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1
+			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		dragging = false
+		if not moved and on_click then on_click() end
+	end)
+end
+
+-- botão maçã
+local button = Instance.new("TextButton")
+button.Size = UDim2.fromOffset(52, 52)
+button.Position = UDim2.new(0, 20, 0.4, 0)
+button.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+button.AutoButtonColor = false
+button.BorderSizePixel = 0
+button.Text = "🍎"
+button.TextSize = 30
+button.Font = Enum.Font.GothamBold
+button.TextColor3 = Color3.fromRGB(255, 255, 255)
+button.Parent = gui
+Instance.new("UICorner", button).CornerRadius = UDim.new(1, 0)
+local bstroke = Instance.new("UIStroke", button)
+bstroke.Color = Color3.fromRGB(55, 55, 55)
+bstroke.Thickness = 1
+
+-- painel
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromOffset(300, 360)
+panel.Position = UDim2.new(0.5, -150, 0.5, -180)
+panel.BackgroundColor3 = Color3.fromRGB(8, 8, 8)
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+local pstroke = Instance.new("UIStroke", panel)
+pstroke.Color = Color3.fromRGB(45, 45, 45)
+pstroke.Thickness = 1
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 34)
+header.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+header.BorderSizePixel = 0
+header.Parent = panel
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -80, 1, 0)
+title.Position = UDim2.fromOffset(12, 0)
+title.BackgroundTransparency = 1
+title.Text = "🍎 Maça Hubz"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 14
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
+
+local function header_btn(text, xoff)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(24, 24)
+	b.Position = UDim2.new(1, xoff, 0, 5)
+	b.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(220, 220, 220)
+	b.TextSize = 12
+	b.Font = Enum.Font.GothamBold
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.Parent = header
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	return b
+end
+local close_btn = header_btn("✕", -30)
+local min_btn   = header_btn("—", -58)
+
+-- tabbar
+local tabbar = Instance.new("Frame")
+tabbar.Size = UDim2.new(1, -16, 0, 28)
+tabbar.Position = UDim2.fromOffset(8, 38)
+tabbar.BackgroundTransparency = 1
+tabbar.Parent = panel
+local tl = Instance.new("UIListLayout")
+tl.FillDirection = Enum.FillDirection.Horizontal
+tl.Padding = UDim.new(0, 4)
+tl.Parent = tabbar
+
+-- content
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -16, 1, -116)
+content.Position = UDim2.fromOffset(8, 72)
+content.BackgroundTransparency = 1
+content.Parent = panel
+
+-- status bar
+local status_bar = Instance.new("Frame")
+status_bar.Size = UDim2.new(1, -16, 0, 34)
+status_bar.Position = UDim2.new(0, 8, 1, -42)
+status_bar.BackgroundColor3 = Color3.fromRGB(14, 14, 14)
+status_bar.BorderSizePixel = 0
+status_bar.Parent = panel
+Instance.new("UICorner", status_bar).CornerRadius = UDim.new(0, 8)
+
+local status_lbl = Instance.new("TextLabel")
+status_lbl.Size = UDim2.fromScale(1, 1)
+status_lbl.BackgroundTransparency = 1
+status_lbl.Text = "aguardando..."
+status_lbl.TextColor3 = Color3.fromRGB(140, 140, 140)
+status_lbl.TextSize = 11
+status_lbl.Font = Enum.Font.Gotham
+status_lbl.TextXAlignment = Enum.TextXAlignment.Center
+status_lbl.Parent = status_bar
+ui.status = status_lbl
+
+-- ================= UI FACTORIES =================
+local TABS = {}
+local active_tab = nil
+
+local function show_tab(name)
+	for n, f in pairs(TABS) do f.Visible = (n == name) end
+	active_tab = name
+	for _, other in ipairs(tabbar:GetChildren()) do
+		if other:IsA("TextButton") then
+			local on = other.Text == name
+			other.BackgroundColor3 = on and Color3.fromRGB(30, 45, 35)
+				or Color3.fromRGB(18, 18, 18)
+			local os = other:FindFirstChildOfClass("UIStroke")
+			if os then os.Color = on and Color3.fromRGB(90, 220, 120)
+				or Color3.fromRGB(45, 45, 45) end
+		end
+	end
+end
+
+local function make_tab_button(name)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0, 66, 1, 0)
+	b.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	b.Text = name
+	b.TextColor3 = Color3.fromRGB(200, 200, 200)
+	b.TextSize = 11
+	b.Font = Enum.Font.GothamBold
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.Parent = tabbar
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	local s = Instance.new("UIStroke", b)
+	s.Color = Color3.fromRGB(45, 45, 45)
+	s.Thickness = 1
+	b.MouseButton1Click:Connect(function() show_tab(name) end)
+	return b
+end
+
+local function make_tab_content(name)
+	local f = Instance.new("Frame")
+	f.Name = name
+	f.Size = UDim2.fromScale(1, 1)
+	f.BackgroundTransparency = 1
+	f.Visible = false
+	f.Parent = content
+	local l = Instance.new("UIListLayout")
+	l.Padding = UDim.new(0, 6)
+	l.Parent = f
+	TABS[name] = f
+	return f
+end
+
+local toggle_renders = {}
+
+local function make_toggle(parent, label, key)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 34)
+	b.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	b.TextColor3 = Color3.fromRGB(230, 230, 230)
+	b.TextSize = 12
+	b.Font = Enum.Font.GothamMedium
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.Parent = parent
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+	local s = Instance.new("UIStroke", b)
+	s.Color = Color3.fromRGB(45, 45, 45)
+	s.Thickness = 1
+	local function render()
+		local on = state[key]
+		b.Text = label .. ": " .. (on and "ON" or "OFF")
+		b.BackgroundColor3 = on and Color3.fromRGB(25, 45, 30)
+			or Color3.fromRGB(18, 18, 18)
+		s.Color = on and Color3.fromRGB(90, 220, 120)
+			or Color3.fromRGB(45, 45, 45)
+	end
+	render()
+	table.insert(toggle_renders, render)
+	b.MouseButton1Click:Connect(function()
+		state[key] = not state[key]
+		render()
+	end)
+	return b
+end
+
+local function make_action(parent, label, cb)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 34)
+	b.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+	b.Text = label
+	b.TextColor3 = Color3.fromRGB(220, 220, 255)
+	b.TextSize = 12
+	b.Font = Enum.Font.GothamMedium
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.Parent = parent
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+	local s = Instance.new("UIStroke", b)
+	s.Color = Color3.fromRGB(60, 60, 100)
+	s.Thickness = 1
+	b.MouseButton1Click:Connect(function()
+		pcall(cb)
+		set_status(label .. " — disparado")
+	end)
+	return b
+end
+
+-- ================= MONTAGEM DAS ABAS =================
+local tab_farm    = make_tab_content("Farm")
+local tab_corrida = make_tab_content("Corrida")
+local tab_defesa  = make_tab_content("Defesa")
+local tab_eggs    = make_tab_content("Eggs")
+make_tab_button("Farm")
+make_tab_button("Corrida")
+make_tab_button("Defesa")
+make_tab_button("Eggs")
+
+make_toggle(tab_farm, "Auto Steal (prompt instant)", "auto_grab")
+make_toggle(tab_farm, "Auto-return + deposit", "auto_return")
+make_toggle(tab_farm, "Auto Farm (ciclo completo)", "auto_farm")
+make_action(tab_farm, "TP → ovo mais próximo", tp_nearest_egg)
+make_action(tab_farm, "TP → base", tp_to_base)
+
+make_toggle(tab_corrida, "Speed hack enquanto carrega", "speed_carry")
+
+make_toggle(tab_defesa, "Anti-stun / anti-ragdoll", "anti_stun")
+make_toggle(tab_defesa, "Radar de jogadores", "radar")
+
+-- ================= EGG LIST =================
+local ctrl = Instance.new("Frame")
+ctrl.Size = UDim2.new(1, 0, 0, 30)
+ctrl.BackgroundTransparency = 1
+ctrl.Parent = tab_eggs
+local ctrl_l = Instance.new("UIListLayout")
+ctrl_l.FillDirection = Enum.FillDirection.Horizontal
+ctrl_l.Padding = UDim.new(0, 4)
+ctrl_l.Parent = ctrl
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, 0, 1, -34)
+scroll.Position = UDim2.fromOffset(0, 34)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 80)
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.Parent = tab_eggs
+local sl = Instance.new("UIListLayout")
+sl.Padding = UDim.new(0, 4)
+sl.Parent = scroll
+
+local function mini_btn(parent, label, bg, fg)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0, 86, 1, 0)
+	b.BackgroundColor3 = bg
+	b.Text = label
+	b.TextColor3 = fg
+	b.TextSize = 11
+	b.Font = Enum.Font.GothamBold
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.Parent = parent
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	local s = Instance.new("UIStroke", b)
+	s.Color = Color3.fromRGB(55, 55, 55); s.Thickness = 1
+	return b, s
+end
+
+local function refresh_egg_list()
+	for _, c in ipairs(scroll:GetChildren()) do
+		if c:IsA("Frame") then c:Destroy() end
+	end
+	local hrp = get_root()
+	if not hrp then return end
+	local eggs = find_eggs()
+	table.sort(eggs, function(a, b)
+		return (hrp.Position - a.Position).Magnitude
+			< (hrp.Position - b.Position).Magnitude
+	end)
+	for i, egg in ipairs(eggs) do
+		if i > 60 then break end
+		local dist = (hrp.Position - egg.Position).Magnitude
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, -4, 0, 28)
+		row.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+		row.BorderSizePixel = 0
+		row.Parent = scroll
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, -70, 1, 0)
+		lbl.Position = UDim2.fromOffset(8, 0)
+		lbl.BackgroundTransparency = 1
+		lbl.Text = string.format("%s · %dm", egg.Name, math.floor(dist))
+		lbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+		lbl.TextSize = 11
+		lbl.Font = Enum.Font.Gotham
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.Parent = row
+		local st = Instance.new("TextButton")
+		st.Size = UDim2.fromOffset(56, 22)
+		st.Position = UDim2.new(1, -62, 0.5, -11)
+		st.BackgroundColor3 = Color3.fromRGB(25, 45, 30)
+		st.Text = "Steal"
+		st.TextColor3 = Color3.fromRGB(120, 240, 140)
+		st.TextSize = 11
+		st.Font = Enum.Font.GothamBold
+		st.AutoButtonColor = false
+		st.BorderSizePixel = 0
+		st.Parent = row
+		Instance.new("UICorner", st).CornerRadius = UDim.new(0, 4)
+		local stk = Instance.new("UIStroke", st)
+		stk.Color = Color3.fromRGB(90, 220, 120); stk.Thickness = 1
+		st.MouseButton1Click:Connect(function() steal_part(egg) end)
+	end
+	scroll.CanvasSize = UDim2.new(0, 0, 0, sl.AbsoluteContentSize.Y + 4)
+end
+
+local btn_refresh = mini_btn(ctrl, "↻ Refresh",
+	Color3.fromRGB(18, 18, 18), Color3.fromRGB(220, 220, 220))
+btn_refresh.MouseButton1Click:Connect(refresh_egg_list)
+
+local qs_btn, qs_stroke = mini_btn(ctrl, "Quick Step",
+	Color3.fromRGB(18, 18, 18), Color3.fromRGB(230, 230, 230))
+local function render_qs()
+	qs_btn.Text = "Quick Step: " .. (state.quick_step and "ON" or "OFF")
+	qs_btn.BackgroundColor3 = state.quick_step
+		and Color3.fromRGB(25, 45, 30) or Color3.fromRGB(18, 18, 18)
+	qs_stroke.Color = state.quick_step
+		and Color3.fromRGB(90, 220, 120) or Color3.fromRGB(55, 55, 55)
+end
+render_qs()
+qs_btn.MouseButton1Click:Connect(function()
+	state.quick_step = not state.quick_step
+	render_qs()
+end)
+
+local sh_btn, sh_stroke = mini_btn(ctrl, "Shuffle",
+	Color3.fromRGB(18, 18, 18), Color3.fromRGB(230, 230, 230))
+local function render_sh()
+	sh_btn.Text = "Shuffle: " .. (state.shuffle and "ON" or "OFF")
+	sh_btn.BackgroundColor3 = state.shuffle
+		and Color3.fromRGB(45, 30, 30) or Color3.fromRGB(18, 18, 18)
+	sh_stroke.Color = state.shuffle
+		and Color3.fromRGB(240, 120, 120) or Color3.fromRGB(55, 55, 55)
+end
+render_sh()
+sh_btn.MouseButton1Click:Connect(function()
+	state.shuffle = not state.shuffle
+	render_sh()
+end)
+
+refresh_egg_list()
+task.spawn(function()
+	while task.wait(2) do
+		if active_tab == "Eggs" then pcall(refresh_egg_list) end
+	end
+end)
+
+-- ================= NAVEGAÇÃO =================
+close_btn.MouseButton1Click:Connect(function()
+	panel.Visible = false
+	button.Visible = true
+end)
+min_btn.MouseButton1Click:Connect(function()
+	content.Visible  = not content.Visible
+	tabbar.Visible   = content.Visible
+	panel.Size = content.Visible
+		and UDim2.fromOffset(300, 360) or UDim2.fromOffset(300, 44)
+end)
+
+drag_frame(button, button, function()
+	panel.Visible = true
+	button.Visible = false
+end)
+drag_frame(panel, header)
+
+UIS.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		panel.Visible  = not panel.Visible
+		button.Visible = not panel.Visible
+	end
+end)
+
+show_tab("Farm")
+
+-- status ticker
+task.spawn(function()
+	while task.wait(0.5) do
+		local carrying = carrying_egg()
+		status_lbl.Text = string.format(
+			"carregando: %s · steals: %d · returns: %d",
+			carrying and "SIM" or "não", stats.grabs, stats.returns)
+	end
+end)
+
+-- keep alive
+task.spawn(function()
+	while gui.Parent do task.wait(1) end
+end)
+
+-- re-render toggles quando personagem respawna
+player.CharacterAdded:Connect(function()
+	task.wait(1)
+	for _, r in ipairs(toggle_renders) do pcall(r) end
+	render_qs()
+	render_sh()
+end)
